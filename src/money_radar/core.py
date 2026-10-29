@@ -6,6 +6,7 @@ import hashlib
 import io
 import re
 import sqlite3
+import ssl
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -16,6 +17,7 @@ from datetime import date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
 
+import certifi
 from openpyxl.utils.exceptions import InvalidFileException
 
 
@@ -187,7 +189,8 @@ class CbrRates:
     @staticmethod
     def _get(url:str,timeout:float)->bytes:
         request=urllib.request.Request(url,headers={"User-Agent":"MoneyRadar/0.1 (+personal local tool)"})
-        with urllib.request.urlopen(request,timeout=timeout) as response: return response.read(2_000_000)
+        context=ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(request,timeout=timeout,context=context) as response: return response.read(2_000_000)
     def rate(self,currency:str,on_date:date|None=None)->Decimal:
         code=currency.upper(); day=on_date or date.today(); key=(code,day)
         if not re.fullmatch(r"[A-Z]{3}", code):

@@ -393,6 +393,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiogram" },
+    { name = "certifi" },
     { name = "openpyxl" },
     { name = "python-dotenv" },
 ]
@@ -406,6 +407,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiogram", specifier = ">=3.13,<4" },
+    { name = "certifi", specifier = ">=2024.8.30" },
     { name = "openpyxl", specifier = ">=3.1,<4" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "python-dotenv", specifier = ">=1,<2" },
