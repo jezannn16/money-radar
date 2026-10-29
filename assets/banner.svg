@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="340" viewBox="0 0 1200 340" role="img" aria-labelledby="money-title money-desc">
+  <title id="money-title">Money Radar</title>
+  <desc id="money-desc">A midnight-indigo finance dashboard with a rising mint chart and a protected local ledger.</desc>
+  <defs>
+    <linearGradient id="money-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#171b3e"/>
+      <stop offset="1" stop-color="#272751"/>
+    </linearGradient>
+    <linearGradient id="money-line" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#57d7bb"/>
+      <stop offset="1" stop-color="#a7efbe"/>
+    </linearGradient>
+    <pattern id="money-dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1" fill="#e8e8ff" fill-opacity=".09"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="340" rx="28" fill="url(#money-bg)"/>
+  <rect width="1200" height="340" rx="28" fill="url(#money-dots)"/>
+  <circle cx="183" cy="336" r="208" fill="#a77aff" fill-opacity=".075"/>
+  <circle cx="1050" cy="28" r="220" fill="#64e4b4" fill-opacity=".08"/>
+  <g transform="translate(724 44)" aria-hidden="true">
+    <rect x="0" y="0" width="394" height="252" rx="22" fill="#11132d" fill-opacity=".58" stroke="#b7b9df" stroke-opacity=".24"/>
+    <text x="25" y="35" fill="#aab1d5" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" font-weight="700" letter-spacing="2.2">MONTHLY SPENDING</text>
+    <rect x="24" y="52" width="346" height="1" fill="#d8dcf4" fill-opacity=".13"/>
+    <path d="M34 203H360M34 158H360M34 113H360" stroke="#d8dcf4" stroke-opacity=".11" stroke-dasharray="3 7"/>
+    <path d="M39 189 91 169 137 177 189 132 237 144 287 94 350 69" fill="none" stroke="url(#money-line)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M39 189 91 169 137 177 189 132 237 144 287 94 350 69V219H39Z" fill="#64deb7" fill-opacity=".09"/>
+    <g fill="#b4f3cf" stroke="#202446" stroke-width="3">
+      <circle cx="39" cy="189" r="5"/><circle cx="91" cy="169" r="5"/><circle cx="137" cy="177" r="5"/><circle cx="189" cy="132" r="5"/><circle cx="237" cy="144" r="5"/><circle cx="287" cy="94" r="5"/><circle cx="350" cy="69" r="6"/>
+    </g>
+    <rect x="24" y="226" width="346" height="1" fill="#d8dcf4" fill-opacity=".13"/>
+    <rect x="25" y="239" width="78" height="5" rx="2.5" fill="#d8dcf4" fill-opacity=".27"/>
+    <rect x="314" y="237" width="55" height="8" rx="4" fill="#a3ebc4" fill-opacity=".75"/>
+  </g>
+  <g font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+    <text x="82" y="92" fill="#a8efc6" font-size="14" font-weight="700" letter-spacing="3.2">LOCAL FINANCE TRACKER</text>
+    <text x="78" y="174" fill="#f5f5ff" font-size="58" font-weight="750" letter-spacing="-2">Money Radar</text>
+    <text x="82" y="225" fill="#c4c5e0" font-size="19" font-weight="400">Расходы, бюджеты и выписки — под вашим контролем.</text>
+    <rect x="82" y="257" width="202" height="30" rx="15" fill="#80e7bd" fill-opacity=".12" stroke="#80e7bd" stroke-opacity=".28"/>
+    <circle cx="100" cy="272" r="4" fill="#80e7bd"/>
+    <text x="113" y="277" fill="#c4f5da" font-size="12" font-weight="650" letter-spacing="1.1">PRIVATE · LOCAL · PREVIEW</text>
+  </g>
+</svg>

@@ -1,5 +1,7 @@
 # Money Radar
 
+![Money Radar — local finance tracker for expenses, budgets, and statements](assets/banner.svg)
+
 Локальный журнал расходов с Decimal-арифметикой, бюджетами и preview перед импортом выписок. CSV/XLSX разбираются на этом компьютере; банковские данные не отправляются сторонним сервисам.
 
 [![CI](https://github.com/jezannn16/money-radar/actions/workflows/ci.yml/badge.svg)](https://github.com/jezannn16/money-radar/actions/workflows/ci.yml)
