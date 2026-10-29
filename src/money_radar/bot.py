@@ -32,7 +32,7 @@ def main()->None:
 
     @dp.message(Command("help"))
     async def help_cmd(message:Message)->None:
-        if await authorize(message):await message.answer("/add merchant amount [currency] — preview с кнопками подтверждения\n/month YYYY-MM — отчёт\n/budget YYYY-MM category amount currency\nЭкспорт/импорт выписок доступны через CLI.")
+        if await authorize(message):await message.answer("/add merchant amount [currency] — preview с кнопками подтверждения\n/month YYYY-MM — отчёт\n/unusual YYYY-MM — кандидаты на необычные расходы\n/budget YYYY-MM category amount currency\n/recurring-add merchant category amount currency [day]\n/recurring-list, /recurring-run YYYY-MM, /recurring-disable ID\nЭкспорт/импорт выписок доступны через CLI.")
 
     @dp.message(Command("add"))
     async def add(message:Message)->None:
@@ -80,6 +80,53 @@ def main()->None:
         if len(parts)!=5:await message.answer("Формат: /budget YYYY-MM category amount currency");return
         try:ledger.set_budget(message.from_user.id,parts[1],parts[2],Decimal(parts[3]),parts[4]);await message.answer("Бюджет сохранён.")
         except ValueError as exc:await message.answer(str(exc))
+
+    @dp.message(Command("unusual"))
+    async def unusual(message:Message)->None:
+        if not await authorize(message):return
+        month_value=(message.text or "").partition(" ")[2].strip()
+        try:candidates=ledger.unusual_expenses(message.from_user.id,month_value)
+        except ValueError as exc:await message.answer(str(exc));return
+        if not candidates:
+            await message.answer("Кандидатов нет. Для сравнения нужны минимум 5 предыдущих расходов в той же категории и валюте.")
+            return
+        lines=[f"{item['date']} {item['merchant']}: {item['amount']} {item['currency']} — медиана {item['baseline_median']} по {item['baseline_count']} прошлым расходам (порог ×{item['factor']})." for item in candidates[:15]]
+        await message.answer("Возможные выбросы, проверьте вручную:\n"+"\n".join(lines))
+
+    @dp.message(Command("recurring-add"))
+    async def recurring_add(message:Message)->None:
+        if not await authorize(message):return
+        parts=(message.text or "").split(maxsplit=5)
+        if len(parts) not in {5,6}:
+            await message.answer("Формат: /recurring-add аренда Дом 50000 RUB [day 1..31]");return
+        try:
+            day=int(parts[5]) if len(parts)==6 else 1
+            rule_id=ledger.add_recurring_rule(message.from_user.id,parts[1],parts[2],Decimal(parts[3]),parts[4],day)
+        except (ValueError,ArithmeticError) as exc:await message.answer(f"Не удалось создать правило: {exc}");return
+        await message.answer(f"Ежемесячное правило #{rule_id} создано. День проводки: {day} (последний день месяца используется для 29–31).")
+
+    @dp.message(Command("recurring-list"))
+    async def recurring_list(message:Message)->None:
+        if not await authorize(message):return
+        rows=ledger.recurring_rules(message.from_user.id)
+        if not rows:await message.answer("Повторяющихся правил нет.");return
+        await message.answer("Ежемесячные правила:\n"+"\n".join(f"#{r['id']} {r['merchant']} — {r['amount']} {r['currency']}, {r['category']}, день {r['day_of_month']}" for r in rows))
+
+    @dp.message(Command("recurring-run"))
+    async def recurring_run(message:Message)->None:
+        if not await authorize(message):return
+        period=(message.text or "").partition(" ")[2].strip()
+        try:result=ledger.run_recurring(message.from_user.id,period)
+        except ValueError as exc:await message.answer(str(exc));return
+        await message.answer(f"Повторяющиеся расходы за {period}: создано {result['created']}, существовало/дубликаты {result['already_processed']+result['duplicates']}.")
+
+    @dp.message(Command("recurring-disable"))
+    async def recurring_disable(message:Message)->None:
+        if not await authorize(message):return
+        try:rule_id=int((message.text or "").partition(" ")[2].strip())
+        except ValueError:await message.answer("Формат: /recurring-disable 12");return
+        changed=ledger.disable_recurring_rule(message.from_user.id,rule_id)
+        await message.answer("Правило отключено." if changed else "Активное правило с таким ID не найдено.")
 
     dp.run_polling(bot)
 

@@ -13,9 +13,15 @@ def main()->None:
     sub=p.add_subparsers(dest="command",required=True)
     add=sub.add_parser("add"); add.add_argument("amount"); add.add_argument("currency"); add.add_argument("merchant"); add.add_argument("--date",default=date.today().isoformat()); add.add_argument("--category",default="Uncategorized"); add.add_argument("--user",type=int,required=True)
     report=sub.add_parser("month"); report.add_argument("month"); report.add_argument("--user",type=int,required=True)
+    unusual=sub.add_parser("unusual"); unusual.add_argument("month"); unusual.add_argument("--user",type=int,required=True)
+    recurring_add=sub.add_parser("recurring-add"); recurring_add.add_argument("merchant"); recurring_add.add_argument("category"); recurring_add.add_argument("amount"); recurring_add.add_argument("currency"); recurring_add.add_argument("--day",type=int,default=1); recurring_add.add_argument("--user",type=int,required=True)
+    recurring_list=sub.add_parser("recurring-list"); recurring_list.add_argument("--user",type=int,required=True)
+    recurring_run=sub.add_parser("recurring-run"); recurring_run.add_argument("period"); recurring_run.add_argument("--user",type=int,required=True)
+    recurring_disable=sub.add_parser("recurring-disable"); recurring_disable.add_argument("rule_id",type=int); recurring_disable.add_argument("--user",type=int,required=True)
     budget=sub.add_parser("budget"); budget.add_argument("month"); budget.add_argument("category"); budget.add_argument("amount"); budget.add_argument("currency"); budget.add_argument("--user",type=int,required=True)
     imp=sub.add_parser("import"); imp.add_argument("file"); imp.add_argument("--user",type=int,required=True); imp.add_argument("--map",action="append",required=True,help="field=CSV column (repeat for date, amount, merchant, currency, category, description, external_id)"); imp.add_argument("--confirm",action="store_true")
     exp=sub.add_parser("export"); exp.add_argument("--user",type=int,required=True)
+    backup=sub.add_parser("backup"); backup.add_argument("destination",help="new path; existing files are never overwritten")
     delete=sub.add_parser("delete-user"); delete.add_argument("--user",type=int,required=True)
     rate=sub.add_parser("rate"); rate.add_argument("currency"); rate.add_argument("--date")
     args=p.parse_args(); ledger=Ledger(args.db)
@@ -31,6 +37,21 @@ def main()->None:
         for item in result["budget_categories_without_spending"]:
             print(f"{item['category']}: расходов нет; бюджет {item['budget']} {item['currency']} не использован")
         if not result["items"]: print("Операций нет.")
+    elif args.command=="unusual":
+        candidates=ledger.unusual_expenses(args.user,args.month)
+        if not candidates: print(f"{args.month}: нет кандидатов; нужны минимум 5 предыдущих расходов в той же категории и валюте.")
+        for item in candidates:
+            print(f"Кандидат #{item['transaction_id']}: {item['date']} | {item['merchant']} | {item['category']} | {item['amount']} {item['currency']} против медианы {item['baseline_median']} ({item['baseline_count']} расходов, порог ×{item['factor']}). Проверьте вручную.")
+    elif args.command=="recurring-add":
+        rule_id=ledger.add_recurring_rule(args.user,args.merchant,args.category,Decimal(args.amount),args.currency,args.day)
+        print(f"Recurring rule #{rule_id} saved.")
+    elif args.command=="recurring-list":
+        for rule in ledger.recurring_rules(args.user):
+            print(f"#{rule['id']} {rule['merchant']} | {rule['category']} | {rule['amount'] or 'unset'} {rule['currency'] or ''} | day {rule['day_of_month']} | {'enabled' if rule['enabled'] else 'disabled'}")
+    elif args.command=="recurring-run":
+        print(ledger.run_recurring(args.user,args.period))
+    elif args.command=="recurring-disable":
+        print("Rule disabled." if ledger.disable_recurring_rule(args.user,args.rule_id) else "Enabled rule not found.")
     elif args.command=="budget":
         ledger.set_budget(args.user,args.month,args.category,Decimal(args.amount),args.currency); print("Бюджет сохранён.")
     elif args.command=="import":
@@ -45,6 +66,7 @@ def main()->None:
         if args.confirm: print(commit_import(ledger,args.user,preview))
         else: print("Ничего не записано. Повторите команду с --confirm для импорта.")
     elif args.command=="export": print(ledger.export_csv(args.user),end="")
+    elif args.command=="backup": print(f"SQLite backup created: {ledger.backup(args.destination)}")
     elif args.command=="delete-user": ledger.delete_user(args.user); print("Данные пользователя удалены.")
     elif args.command=="rate": print(CbrRates().rate(args.currency,date.fromisoformat(args.date) if args.date else None))
 

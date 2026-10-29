@@ -1,5 +1,9 @@
+import sqlite3
 from datetime import date
 from decimal import Decimal
+from stat import S_IMODE
+
+import pytest
 
 from money_radar.core import (
     CbrRates,
@@ -36,6 +40,68 @@ def test_import_preview_then_idempotent_commit(tmp_path):
     result=commit_import(ledger,1,preview)
     assert result["imported"]==1
     assert commit_import(ledger,1,preview)["already_imported"]
+
+
+def test_backup_is_consistent_and_never_overwrites(tmp_path):
+    ledger = Ledger(tmp_path / "source.sqlite3")
+    row = TransactionInput(date(2026, 1, 2), Decimal("12.34"), "RUB", "synthetic cafe")
+    assert ledger.add(4, row)
+    backup_path = ledger.backup(tmp_path / "backup" / "snapshot.sqlite3")
+    assert S_IMODE(backup_path.stat().st_mode) == 0o600
+    restored = Ledger(backup_path)
+    assert restored.month_report(4, "2026-01")["items"][0]["spent"] == Decimal("12.34")
+    with pytest.raises(FileExistsError):
+        ledger.backup(backup_path)
+    with pytest.raises(ValueError, match="differ"):
+        ledger.backup(ledger.path)
+
+
+def test_unusual_spending_is_explainable_and_user_scoped(tmp_path):
+    ledger = Ledger(tmp_path / "db.sqlite3")
+    for month_num in range(7, 13):
+        ledger.add(7, TransactionInput(date(2026, month_num, 10), Decimal(10), "RUB", "market", "Food"))
+    ledger.add(7, TransactionInput(date(2027, 1, 4), Decimal(50), "RUB", "market", "Food"))
+    ledger.add(8, TransactionInput(date(2027, 1, 4), Decimal(500), "RUB", "market", "Food"))
+    candidates = ledger.unusual_expenses(7, "2027-01")
+    assert len(candidates) == 1
+    assert candidates[0]["baseline_median"] == Decimal("10.00")
+    assert candidates[0]["baseline_count"] == 6
+    assert ledger.unusual_expenses(8, "2027-01") == []
+    with pytest.raises(ValueError):
+        ledger.unusual_expenses(7, "2027-1")
+
+
+def test_recurring_rules_apply_once_per_month_and_are_user_scoped(tmp_path):
+    path = tmp_path / "db.sqlite3"
+    ledger = Ledger(path)
+    rule_id = ledger.add_recurring_rule(31, "Rent", "Home", Decimal("1250.00"), "EUR", 31)
+    assert ledger.recurring_rules(32) == []
+    result = ledger.run_recurring(31, "2026-02")
+    assert result == {"created": 1, "duplicates": 0, "already_processed": 0}
+    row = Ledger(path).month_report(31, "2026-02")["items"][0]
+    assert row["spent"] == Decimal("1250.00")
+    with ledger._db() as db:
+        tx = db.execute("SELECT booked_on,external_id FROM transactions WHERE source='recurring'").fetchone()
+    assert tx["booked_on"] == "2026-02-28"
+    assert tx["external_id"] == f"recurring:{rule_id}:2026-02"
+    assert Ledger(path).run_recurring(31, "2026-02") == {"created": 0, "duplicates": 0, "already_processed": 1}
+    assert Ledger(path).month_report(31, "2026-02")["items"][0]["count"] == 1
+    assert ledger.disable_recurring_rule(32, rule_id) is False
+    assert ledger.disable_recurring_rule(31, rule_id) is True
+    assert ledger.run_recurring(31, "2026-03")["created"] == 0
+
+
+def test_recurring_schema_migrates_existing_database(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE recurring_rules(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,merchant TEXT NOT NULL,category TEXT NOT NULL,amount TEXT,currency TEXT,enabled INTEGER NOT NULL DEFAULT 1)")
+        db.execute("INSERT INTO recurring_rules(user_id,merchant,category,amount,currency) VALUES(1,'Rent','Home','10','RUB')")
+    ledger = Ledger(path)
+    assert ledger.recurring_rules(1)[0]["day_of_month"] == 1
+    with ledger._db() as db:
+        columns = {row[1] for row in db.execute("PRAGMA table_info(recurring_rules)")}
+        assert "day_of_month" in columns
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 2
 
 
 def test_cbr_transport_historical_no_fallback_and_cache():

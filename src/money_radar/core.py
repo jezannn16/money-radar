@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
 
@@ -59,11 +59,16 @@ class Ledger:
             CREATE UNIQUE INDEX IF NOT EXISTS uq_transaction_external ON transactions(user_id,source,external_id) WHERE external_id IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS uq_transaction_fingerprint ON transactions(user_id,fingerprint);
             CREATE TABLE IF NOT EXISTS monthly_budgets(user_id INTEGER NOT NULL,month TEXT NOT NULL,category TEXT NOT NULL,amount TEXT NOT NULL,currency TEXT NOT NULL,PRIMARY KEY(user_id,month,category,currency));
-            CREATE TABLE IF NOT EXISTS recurring_rules(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,merchant TEXT NOT NULL,category TEXT NOT NULL,amount TEXT,currency TEXT,enabled INTEGER NOT NULL DEFAULT 1);
+            CREATE TABLE IF NOT EXISTS recurring_rules(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,merchant TEXT NOT NULL,category TEXT NOT NULL,amount TEXT,currency TEXT,enabled INTEGER NOT NULL DEFAULT 1,day_of_month INTEGER NOT NULL DEFAULT 1);
+            CREATE TABLE IF NOT EXISTS recurring_executions(rule_id INTEGER NOT NULL,period TEXT NOT NULL,state TEXT NOT NULL,transaction_id INTEGER,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(rule_id,period));
             CREATE TABLE IF NOT EXISTS import_batches(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,file_hash TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,UNIQUE(user_id,file_hash));
             CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);
             INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,CURRENT_TIMESTAMP);
             """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(recurring_rules)")}
+            if "day_of_month" not in columns:
+                db.execute("ALTER TABLE recurring_rules ADD COLUMN day_of_month INTEGER NOT NULL DEFAULT 1")
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP)")
 
     def _db(self):
         db=sqlite3.connect(self.path,timeout=10); db.row_factory=sqlite3.Row; return db
@@ -90,6 +95,83 @@ class Ledger:
         if not name: raise ValueError("Category name cannot be empty")
         with self._db() as db: db.execute("INSERT OR IGNORE INTO categories(user_id,name) VALUES(?,?)",(user_id,name))
 
+    def add_recurring_rule(
+        self, user_id: int, merchant: str, category: str, amount: Decimal,
+        currency: str, day_of_month: int = 1,
+    ) -> int:
+        merchant = merchant.strip()
+        category = category.strip() or "Uncategorized"
+        if not merchant:
+            raise ValueError("Merchant cannot be empty")
+        if not 1 <= day_of_month <= 31:
+            raise ValueError("Day of month must be between 1 and 31")
+        normalized_amount = money(amount, currency)
+        with self._db() as db:
+            cur = db.execute(
+                "INSERT INTO recurring_rules(user_id,merchant,category,amount,currency,day_of_month) VALUES(?,?,?,?,?,?)",
+                (user_id, merchant, category, str(normalized_amount), currency.upper(), day_of_month),
+            )
+            return int(cur.lastrowid)
+
+    def recurring_rules(self, user_id: int) -> list[sqlite3.Row]:
+        with self._db() as db:
+            return list(db.execute(
+                "SELECT id,merchant,category,amount,currency,day_of_month,enabled FROM recurring_rules WHERE user_id=? ORDER BY id",
+                (user_id,),
+            ))
+
+    def disable_recurring_rule(self, user_id: int, rule_id: int) -> bool:
+        with self._db() as db:
+            cur = db.execute(
+                "UPDATE recurring_rules SET enabled=0 WHERE id=? AND user_id=? AND enabled=1",
+                (rule_id, user_id),
+            )
+            return bool(cur.rowcount)
+
+    def run_recurring(self, user_id: int, period: str) -> dict[str, int]:
+        """Apply enabled monthly rules once; rule/period uniqueness makes reruns idempotent."""
+        if not re.fullmatch(r"\d{4}-\d{2}", period):
+            raise ValueError("Period must use YYYY-MM")
+        try:
+            year, month_num = (int(part) for part in period.split("-"))
+            first_day = date(year, month_num, 1)
+        except ValueError as exc:
+            raise ValueError("Period must use YYYY-MM") from exc
+        next_month = date(year + (month_num == 12), month_num % 12 + 1, 1)
+        last_day = (next_month - timedelta(days=1)).day
+        created = duplicates = already_processed = 0
+        with self._db() as db:
+            rules = list(db.execute(
+                "SELECT id,merchant,category,amount,currency,day_of_month FROM recurring_rules WHERE user_id=? AND enabled=1 AND amount IS NOT NULL AND currency IS NOT NULL ORDER BY id",
+                (user_id,),
+            ))
+            for rule in rules:
+                cur = db.execute(
+                    "INSERT OR IGNORE INTO recurring_executions(rule_id,period,state) VALUES(?,?,'running')",
+                    (rule["id"], period),
+                )
+                if not cur.rowcount:
+                    already_processed += 1
+                    continue
+                booked_on = first_day.replace(day=min(rule["day_of_month"], last_day))
+                row = TransactionInput(
+                    booked_on, Decimal(rule["amount"]), rule["currency"],
+                    rule["merchant"], rule["category"], source="recurring",
+                    external_id=f"recurring:{rule['id']}:{period}",
+                )
+                try:
+                    tx = db.execute(
+                        "INSERT INTO transactions(user_id,booked_on,amount,currency,merchant,category,description,source,external_id,fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (user_id, booked_on.isoformat(), str(money(row.amount, row.currency)), row.currency.upper(), row.merchant, row.category, "Monthly recurring rule", row.source, row.external_id, self.fingerprint(row)),
+                    )
+                except sqlite3.IntegrityError:
+                    db.execute("UPDATE recurring_executions SET state='duplicate' WHERE rule_id=? AND period=?", (rule["id"], period))
+                    duplicates += 1
+                else:
+                    db.execute("UPDATE recurring_executions SET state='created',transaction_id=? WHERE rule_id=? AND period=?", (tx.lastrowid, rule["id"], period))
+                    created += 1
+        return {"created": created, "duplicates": duplicates, "already_processed": already_processed}
+
     def set_budget(self,user_id:int,month:str,category:str,amount:Decimal,currency:str)->None:
         try: datetime.strptime(month,"%Y-%m")
         except ValueError as exc: raise ValueError("Month must use YYYY-MM") from exc
@@ -111,13 +193,88 @@ class Ledger:
             report.append({"category":category,"currency":currency,"spent":spent,"count":count,"budget":budget,"remaining":budget-spent if budget is not None else None})
         return {"month":month,"items":report,"budget_categories_without_spending":[{"category":b["category"],"currency":b["currency"],"budget":Decimal(b["amount"])} for b in budgets if not any(i["category"]==b["category"] and i["currency"]==b["currency"] for i in report)]}
 
+    def unusual_expenses(
+        self, user_id: int, month: str, lookback_months: int = 6,
+        factor: Decimal = Decimal(3), minimum_samples: int = 5,
+    ) -> list[dict]:
+        """Flag transparent candidates above a historical category/currency median."""
+        try:
+            if not re.fullmatch(r"\d{4}-\d{2}", month):
+                raise ValueError
+            year, month_num = (int(part) for part in month.split("-"))
+            datetime(year, month_num, 1)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Month must use YYYY-MM") from exc
+        if not 1 <= lookback_months <= 36 or minimum_samples < 1 or factor <= 1:
+            raise ValueError("Lookback must be 1..36 months, samples positive, factor greater than 1")
+        target_index = year * 12 + month_num - 1
+        start_index = target_index - lookback_months
+        start_year, start_month0 = divmod(start_index, 12)
+        start = f"{start_year:04d}-{start_month0 + 1:02d}-01"
+        end = f"{year:04d}-{month_num:02d}-01"
+        end_index = target_index + 1
+        end_year, end_month0 = divmod(end_index, 12)
+        next_month = f"{end_year:04d}-{end_month0 + 1:02d}-01"
+        with self._db() as db:
+            baseline_rows = list(db.execute(
+                "SELECT category,currency,amount FROM transactions WHERE user_id=? AND booked_on>=? AND booked_on<?",
+                (user_id, start, end),
+            ))
+            current_rows = list(db.execute(
+                "SELECT id,booked_on,amount,currency,merchant,category FROM transactions WHERE user_id=? AND booked_on>=? AND booked_on<? ORDER BY booked_on,id",
+                (user_id, end, next_month),
+            ))
+        baselines: dict[tuple[str, str], list[Decimal]] = {}
+        for row in baseline_rows:
+            baselines.setdefault((row["category"], row["currency"]), []).append(Decimal(row["amount"]))
+        candidates = []
+        for row in current_rows:
+            values = sorted(baselines.get((row["category"], row["currency"]), []))
+            if len(values) < minimum_samples:
+                continue
+            middle = len(values) // 2
+            median = values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
+            amount = Decimal(row["amount"])
+            if amount >= median * factor:
+                candidates.append({
+                    "transaction_id": row["id"], "date": row["booked_on"],
+                    "merchant": row["merchant"], "category": row["category"],
+                    "amount": amount, "currency": row["currency"],
+                    "baseline_median": median, "baseline_count": len(values),
+                    "factor": factor,
+                })
+        return candidates
+
     def export_csv(self,user_id:int)->str:
         with self._db() as db: rows=list(db.execute("SELECT booked_on,amount,currency,merchant,category,description,source,external_id FROM transactions WHERE user_id=? ORDER BY booked_on,id",(user_id,)))
         out=io.StringIO(); writer=csv.writer(out); writer.writerow(["date","amount","currency","merchant","category","description","source","external_id"])
         writer.writerows([tuple(row) for row in rows]); return out.getvalue()
 
+    def backup(self, destination: str | Path) -> Path:
+        """Create a consistent SQLite backup without overwriting an existing file."""
+        target = Path(destination).expanduser().resolve()
+        source = Path(self.path).expanduser().resolve()
+        if target == source:
+            raise ValueError("Backup destination must differ from the active database")
+        if target.exists():
+            raise FileExistsError(f"Backup destination already exists: {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        backup_db = sqlite3.connect(target)
+        try:
+            with self._db() as source_db:
+                source_db.backup(backup_db)
+        except Exception:
+            backup_db.close()
+            target.unlink(missing_ok=True)
+            raise
+        else:
+            backup_db.close()
+            target.chmod(0o600)
+        return target
+
     def delete_user(self,user_id:int)->None:
         with self._db() as db:
+            db.execute("DELETE FROM recurring_executions WHERE rule_id IN (SELECT id FROM recurring_rules WHERE user_id=?)",(user_id,))
             db.execute("DELETE FROM transactions WHERE user_id=?",(user_id,)); db.execute("DELETE FROM categories WHERE user_id=?",(user_id,)); db.execute("DELETE FROM monthly_budgets WHERE user_id=?",(user_id,)); db.execute("DELETE FROM recurring_rules WHERE user_id=?",(user_id,)); db.execute("DELETE FROM import_batches WHERE user_id=?",(user_id,))
 
 
