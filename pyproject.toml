@@ -1,0 +1,25 @@
+[project]
+name = "money-radar"
+version = "0.1.0"
+description = "Private expenses and statement importer"
+requires-python = ">=3.11"
+dependencies = ["aiogram>=3.13,<4", "python-dotenv>=1,<2", "openpyxl>=3.1,<4"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+money-radar = "money_radar.cli:main"
+money-radar-bot = "money_radar.bot:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

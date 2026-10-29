@@ -1,0 +1,1 @@
+"""Private expense ledger."""
