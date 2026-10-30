@@ -28,6 +28,8 @@ def create_app(token:str,allowed:set[int],ledger:Ledger)->tuple[Bot,Dispatcher]:
     pending:dict[str,tuple[int,TransactionInput]]={}
 
     async def authorize(message:Message)->bool:
+        if message.chat.type != "private":
+            await message.answer("Money Radar отвечает только в личном чате, чтобы не раскрывать финансовые данные.");return False
         if not message.from_user or message.from_user.id not in allowed:
             await message.answer("Доступ закрыт. Добавьте свой Telegram ID в ALLOWED_USER_IDS.");return False
         return True
@@ -88,7 +90,9 @@ def create_app(token:str,allowed:set[int],ledger:Ledger)->tuple[Bot,Dispatcher]:
 
     @dp.callback_query(F.data.startswith("confirm:"))
     async def confirm(call:CallbackQuery)->None:
-        if not call.from_user or call.from_user.id not in allowed:await call.answer("Доступ закрыт",show_alert=True);return
+        if (not call.from_user or call.from_user.id not in allowed or not call.message
+                or call.message.chat.type != "private"):
+            await call.answer("Доступ закрыт: подтверждения доступны только в личном чате",show_alert=True);return
         key=call.data.removeprefix("confirm:");pending_row=pending.get(key)
         if pending_row is None:await call.answer("Preview истёк или уже обработан",show_alert=True);return
         if pending_row[0]!=call.from_user.id:await call.answer("Это preview другого пользователя",show_alert=True);return
@@ -99,7 +103,9 @@ def create_app(token:str,allowed:set[int],ledger:Ledger)->tuple[Bot,Dispatcher]:
 
     @dp.callback_query(F.data.startswith("cancel:"))
     async def cancel(call:CallbackQuery)->None:
-        if not call.from_user or call.from_user.id not in allowed:await call.answer("Доступ закрыт",show_alert=True);return
+        if (not call.from_user or call.from_user.id not in allowed or not call.message
+                or call.message.chat.type != "private"):
+            await call.answer("Доступ закрыт: подтверждения доступны только в личном чате",show_alert=True);return
         key=call.data.removeprefix("cancel:");pending_row=pending.get(key)
         if pending_row and pending_row[0]!=call.from_user.id:await call.answer("Это preview другого пользователя",show_alert=True);return
         pending.pop(key,None)

@@ -167,3 +167,17 @@ def test_cbr_rate_cache_survives_adapter_restart(tmp_path):
     second=CbrRates(lambda url,timeout:(_ for _ in ()).throw(AssertionError("persistent cache should avoid network")),ledger=Ledger(ledger.path))
     assert second.quote("USD",requested)==quote
     assert len(calls)==2 and quote.effective_date==requested
+
+
+def test_cbr_timeout_is_reported_without_fabricating_a_rate():
+    adapter=CbrRates(lambda _url,_timeout:(_ for _ in ()).throw(TimeoutError("synthetic timeout")))
+    with pytest.raises(RuntimeError,match="temporarily unavailable"):
+        adapter.quote("USD",date(2025,1,15))
+
+
+def test_cbr_historical_response_must_match_requested_date():
+    daily=b'<ValCurs><Valute ID="R01235"><CharCode>USD</CharCode></Valute></ValCurs>'
+    historical=b'<ValCurs><Record Date="14.01.2025"><Nominal>1</Nominal><Value>80,00</Value></Record></ValCurs>'
+    adapter=CbrRates(lambda url,_timeout:daily if "XML_daily" in url else historical)
+    with pytest.raises(ValueError,match="No exact CBR rate"):
+        adapter.quote("USD",date(2025,1,15))

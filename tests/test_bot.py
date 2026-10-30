@@ -42,3 +42,33 @@ def test_plain_text_expense_requires_confirmation_and_preview_owner(tmp_path):
             await bot.session.close()
 
     asyncio.run(scenario())
+
+
+def test_group_chat_cannot_read_ledger_or_confirm_a_preview(tmp_path):
+    async def scenario():
+        ledger=Ledger(tmp_path/"group.sqlite3")
+        ledger.add(51,parse_expense_input("кофе 350 RUB"))
+        bot,dispatcher=create_app("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",{51},ledger)
+        private=Message(message_id=1,date=datetime.now(UTC),chat=Chat(id=51,type="private"),from_user=User(id=51,is_bot=False,first_name="Owner"),text="такси 780")
+        try:
+            with patch("aiogram.client.bot.Bot.__call__",new_callable=AsyncMock) as telegram:
+                await dispatcher.feed_update(bot,Update(update_id=1,message=private))
+                preview=telegram.await_args.args[0]
+                callback_data=preview.reply_markup.inline_keyboard[0][0].callback_data
+                cancel_data=preview.reply_markup.inline_keyboard[0][1].callback_data
+                group_message=Message(message_id=2,date=datetime.now(UTC),chat=Chat(id=-100,type="supergroup"),from_user=private.from_user,text="/month 2026-10")
+                await dispatcher.feed_update(bot,Update(update_id=2,message=group_message))
+                assert "только в личном чате" in telegram.await_args.args[0].text
+                group_callback=CallbackQuery(id="group-confirm",from_user=private.from_user,chat_instance="group",message=Message(message_id=3,date=datetime.now(UTC),chat=group_message.chat,from_user=private.from_user,text="preview"),data=callback_data)
+                await dispatcher.feed_update(bot,Update(update_id=3,callback_query=group_callback))
+                group_cancel=CallbackQuery(id="group-cancel",from_user=private.from_user,chat_instance="group",message=group_callback.message,data=cancel_data)
+                await dispatcher.feed_update(bot,Update(update_id=4,callback_query=group_cancel))
+                assert "Доступ закрыт" in telegram.await_args.args[0].text
+                assert len(ledger.filter_transactions(51))==1
+                private_confirm=CallbackQuery(id="private-confirm",from_user=private.from_user,chat_instance="private",message=private,data=callback_data)
+                await dispatcher.feed_update(bot,Update(update_id=5,callback_query=private_confirm))
+                assert len(ledger.filter_transactions(51))==2
+        finally:
+            await bot.session.close()
+
+    asyncio.run(scenario())
