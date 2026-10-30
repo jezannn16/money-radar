@@ -117,8 +117,10 @@ class Ledger:
         clauses=["user_id=?"]; values:list[object]=[user_id]
         for field,value,operator in (("booked_on",date_from,">="),("booked_on",date_to,"<=")):
             if value:
-                try: date.fromisoformat(value)
+                try: parsed=date.fromisoformat(value)
                 except ValueError as exc: raise ValueError("Dates must use YYYY-MM-DD") from exc
+                if parsed.isoformat()!=value:
+                    raise ValueError("Dates must use YYYY-MM-DD")
                 clauses.append(f"{field}{operator}?"); values.append(value)
         if date_from and date_to and date_from>date_to:
             raise ValueError("date_from must be on or before date_to")

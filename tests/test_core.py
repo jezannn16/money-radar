@@ -1,6 +1,7 @@
 import sqlite3
 from datetime import date
 from decimal import Decimal
+from io import BytesIO
 from stat import S_IMODE
 
 import pytest
@@ -42,6 +43,23 @@ def test_import_preview_then_idempotent_commit(tmp_path):
     assert commit_import(ledger,1,preview)["already_imported"]
 
 
+def test_xlsx_import_preview_commit_and_duplicate_batch(tmp_path):
+    from openpyxl import Workbook
+
+    workbook=Workbook();sheet=workbook.active
+    sheet.append(["Date","Amount","Currency","Merchant","Category"])
+    sheet.append([date(2026,10,1),"125.50","RUB","Synthetic shop","Home"])
+    payload=BytesIO();workbook.save(payload);data=payload.getvalue()
+    mapping={"date":"Date","amount":"Amount","currency":"Currency","merchant":"Merchant","category":"Category"}
+    preview=parse_statement(data,mapping,"synthetic.xlsx")
+    assert len(preview.rows)==1 and not preview.errors and preview.rows[0].amount==Decimal("125.50")
+    ledger=Ledger(tmp_path/"xlsx.sqlite3")
+    assert ledger.month_report(44,"2026-10")["items"]==[]
+    result=commit_import(ledger,44,preview)
+    assert result["imported"]==1 and ledger.month_report(44,"2026-10")["items"][0]["spent"]==Decimal("125.50")
+    assert commit_import(ledger,44,preview)["already_imported"] is True
+
+
 def test_backup_is_consistent_and_never_overwrites(tmp_path):
     ledger = Ledger(tmp_path / "source.sqlite3")
     row = TransactionInput(date(2026, 1, 2), Decimal("12.34"), "RUB", "synthetic cafe")
@@ -74,6 +92,8 @@ def test_categories_and_transaction_filters_are_user_scoped(tmp_path):
     assert len(ledger.filter_transactions(1,category="Food",merchant="north"))==1
     with pytest.raises(ValueError,match="on or before"):
         ledger.filter_transactions(1,date_from="2026-02-01",date_to="2026-01-01")
+    with pytest.raises(ValueError,match="YYYY-MM-DD"):
+        ledger.filter_transactions(1,date_from="20260101")
 
 
 def test_unusual_spending_is_explainable_and_user_scoped(tmp_path):

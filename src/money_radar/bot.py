@@ -14,12 +14,18 @@ from dotenv import load_dotenv
 from .core import Ledger, TransactionInput, money
 
 
-def main()->None:
-    load_dotenv();token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
-    allowed={int(v) for v in os.getenv("ALLOWED_USER_IDS","").split(",") if v.strip().isdigit()}
-    if not token or not allowed:raise SystemExit("Set TELEGRAM_BOT_TOKEN and ALLOWED_USER_IDS in .env")
-    ledger=Ledger(os.getenv("DATABASE_PATH","money_radar.sqlite3"));bot=Bot(token);dp=Dispatcher()
-    pending:dict[str,TransactionInput]={}
+def parse_expense_input(text: str, booked_on: date | None = None) -> TransactionInput:
+    match=re.fullmatch(r"(.+?)\s+([0-9]+(?:[.,][0-9]{1,4})?)(?:\s+([A-Za-z]{3}))?",text.strip())
+    if not match:
+        raise ValueError("Формат: кофе 350 RUB или такси 780. Сумму/валюту проверьте в preview.")
+    merchant,amount,currency=match.group(1),match.group(2).replace(",","."),(match.group(3) or "RUB").upper()
+    return TransactionInput(booked_on or date.today(),money(amount,currency),currency,merchant)
+
+
+def create_app(token:str,allowed:set[int],ledger:Ledger)->tuple[Bot,Dispatcher]:
+    if not token.strip() or not allowed:raise ValueError("Token and at least one allowed user ID are required")
+    bot=Bot(token.strip());dp=Dispatcher()
+    pending:dict[str,tuple[int,TransactionInput]]={}
 
     async def authorize(message:Message)->bool:
         if not message.from_user or message.from_user.id not in allowed:
@@ -65,23 +71,28 @@ def main()->None:
 
     @dp.message(Command("add"))
     async def add(message:Message)->None:
-        if not await authorize(message):return
         text=(message.text or "").partition(" ")[2].strip()
-        match=re.fullmatch(r"(.+?)\s+([0-9]+(?:[.,][0-9]{1,4})?)(?:\s+([A-Za-z]{3}))?",text)
-        if not match:
-            await message.answer("Формат: /add кофе 350 RUB. Сумму/валюту проверьте в preview.");return
-        merchant,amount,currency=match.group(1),match.group(2).replace(",","."),(match.group(3) or "RUB").upper()
-        try:row=TransactionInput(date.today(),money(amount,currency),currency,merchant)
+        await preview_expense(message,text)
+
+    async def preview_expense(message:Message,text:str)->None:
+        if not await authorize(message):return
+        try:row=parse_expense_input(text)
         except ValueError as exc:await message.answer(f"Не удалось распознать расход: {exc}");return
-        key=f"{message.from_user.id}:{message.message_id}";pending[key]=row
+        key=f"{message.from_user.id}:{message.message_id}";pending[key]=(message.from_user.id,row)
         kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Подтвердить",callback_data=f"confirm:{key}"),InlineKeyboardButton(text="Отмена",callback_data=f"cancel:{key}")]])
         await message.answer(f"Проверьте расход:\nСумма: {row.amount} {row.currency}\nДата: {row.booked_on}\nМесто: {row.merchant}\nКатегория: {row.category}",reply_markup=kb)
+
+    @dp.message(F.text & ~F.text.startswith("/"))
+    async def plain_expense(message:Message)->None:
+        await preview_expense(message,(message.text or "").strip())
 
     @dp.callback_query(F.data.startswith("confirm:"))
     async def confirm(call:CallbackQuery)->None:
         if not call.from_user or call.from_user.id not in allowed:await call.answer("Доступ закрыт",show_alert=True);return
-        key=call.data.removeprefix("confirm:");row=pending.pop(key,None)
-        if row is None:await call.answer("Preview истёк или уже обработан",show_alert=True);return
+        key=call.data.removeprefix("confirm:");pending_row=pending.get(key)
+        if pending_row is None:await call.answer("Preview истёк или уже обработан",show_alert=True);return
+        if pending_row[0]!=call.from_user.id:await call.answer("Это preview другого пользователя",show_alert=True);return
+        _,row=pending.pop(key)
         saved=ledger.add(call.from_user.id,row)
         if call.message:await call.message.edit_text("Расход сохранён." if saved else "Похожая операция уже есть; дубль не добавлен.")
         await call.answer()
@@ -89,7 +100,9 @@ def main()->None:
     @dp.callback_query(F.data.startswith("cancel:"))
     async def cancel(call:CallbackQuery)->None:
         if not call.from_user or call.from_user.id not in allowed:await call.answer("Доступ закрыт",show_alert=True);return
-        pending.pop(call.data.removeprefix("cancel:"),None)
+        key=call.data.removeprefix("cancel:");pending_row=pending.get(key)
+        if pending_row and pending_row[0]!=call.from_user.id:await call.answer("Это preview другого пользователя",show_alert=True);return
+        pending.pop(key,None)
         if call.message:await call.message.edit_text("Добавление отменено.")
         await call.answer()
 
@@ -157,6 +170,14 @@ def main()->None:
         changed=ledger.disable_recurring_rule(message.from_user.id,rule_id)
         await message.answer("Правило отключено." if changed else "Активное правило с таким ID не найдено.")
 
+    return bot,dp
+
+
+def main()->None:
+    load_dotenv();token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+    allowed={int(v) for v in os.getenv("ALLOWED_USER_IDS","").split(",") if v.strip().isdigit()}
+    if not token or not allowed:raise SystemExit("Set TELEGRAM_BOT_TOKEN and ALLOWED_USER_IDS in .env")
+    ledger=Ledger(os.getenv("DATABASE_PATH","money_radar.sqlite3"));bot,dp=create_app(token,allowed,ledger)
     dp.run_polling(bot)
 
 
