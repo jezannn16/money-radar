@@ -10,20 +10,23 @@ import sqlite3
 import ssl
 import urllib.error
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Callable
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
+from threading import RLock
 
 import certifi
 from openpyxl.utils.exceptions import InvalidFileException
 
 
 def money(value: str | Decimal, currency: str) -> Decimal:
-    if len(currency) != 3 or not currency.isalpha():
+    if len(currency) != 3 or not currency.isascii() or not currency.isalpha():
         raise ValueError("Currency must be a three-letter ISO code")
     try:
         amount = Decimal(str(value))
@@ -49,6 +52,9 @@ class TransactionInput:
 class Ledger:
     def __init__(self, path: str | Path):
         self.path = str(path)
+        self._memory_uri = f"file:money-{uuid.uuid4().hex}?mode=memory&cache=shared" if self.path == ":memory:" else None
+        self._memory_anchor = sqlite3.connect(self._memory_uri, uri=True) if self._memory_uri else None
+        self._memory_lock = RLock() if self._memory_uri else None
         with self._db() as db:
             db.executescript("""
             CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,name TEXT NOT NULL,UNIQUE(user_id,name));
@@ -58,7 +64,6 @@ class Ledger:
               source TEXT NOT NULL,external_id TEXT,fingerprint TEXT NOT NULL,import_batch_id INTEGER,
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
             CREATE UNIQUE INDEX IF NOT EXISTS uq_transaction_external ON transactions(user_id,source,external_id) WHERE external_id IS NOT NULL;
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_transaction_fingerprint ON transactions(user_id,fingerprint);
             CREATE TABLE IF NOT EXISTS monthly_budgets(user_id INTEGER NOT NULL,month TEXT NOT NULL,category TEXT NOT NULL,amount TEXT NOT NULL,currency TEXT NOT NULL,PRIMARY KEY(user_id,month,category,currency));
             CREATE TABLE IF NOT EXISTS recurring_rules(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,merchant TEXT NOT NULL,category TEXT NOT NULL,amount TEXT,currency TEXT,enabled INTEGER NOT NULL DEFAULT 1,day_of_month INTEGER NOT NULL DEFAULT 1);
             CREATE TABLE IF NOT EXISTS recurring_executions(rule_id INTEGER NOT NULL,period TEXT NOT NULL,state TEXT NOT NULL,transaction_id INTEGER,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(rule_id,period));
@@ -67,21 +72,43 @@ class Ledger:
             CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);
             INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,CURRENT_TIMESTAMP);
             """)
+            # Fingerprints are the fallback identity only when a statement row has no
+            # external transaction ID. Rows with distinct bank IDs may legitimately
+            # share date, amount, currency and merchant.
+            fingerprint_index = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_transaction_fingerprint'"
+            ).fetchone()
+            if not fingerprint_index or "WHERE external_id IS NULL" not in fingerprint_index[0]:
+                db.execute("DROP INDEX IF EXISTS uq_transaction_fingerprint")
+                db.execute(
+                    "CREATE UNIQUE INDEX uq_transaction_fingerprint "
+                    "ON transactions(user_id,fingerprint) WHERE external_id IS NULL"
+                )
             columns = {row[1] for row in db.execute("PRAGMA table_info(recurring_rules)")}
             if "day_of_month" not in columns:
                 db.execute("ALTER TABLE recurring_rules ADD COLUMN day_of_month INTEGER NOT NULL DEFAULT 1")
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP)")
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,CURRENT_TIMESTAMP)")
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(4,CURRENT_TIMESTAMP)")
 
+    @contextmanager
     def _db(self):
-        if self.path != ":memory:":
-            fd=os.open(self.path,os.O_CREAT|os.O_RDWR,0o600);os.close(fd)
-        db=sqlite3.connect(self.path,timeout=10)
-        if self.path != ":memory:":
-            for candidate in (self.path,self.path+"-wal",self.path+"-shm",self.path+"-journal"):
-                try:os.chmod(candidate,0o600)
-                except FileNotFoundError:pass
-        db.row_factory=sqlite3.Row; return db
+        # Shared-cache memory databases return SQLITE_LOCKED immediately instead
+        # of honoring busy_timeout, so serialize operations for this instance.
+        with self._memory_lock if self._memory_lock else nullcontext():
+            if self.path != ":memory:":
+                fd=os.open(self.path,os.O_CREAT|os.O_RDWR,0o600);os.close(fd)
+            db=sqlite3.connect(self._memory_uri or self.path,timeout=10,uri=bool(self._memory_uri))
+            try:
+                if self.path != ":memory:":
+                    for candidate in (self.path,self.path+"-wal",self.path+"-shm",self.path+"-journal"):
+                        try:os.chmod(candidate,0o600)
+                        except FileNotFoundError:pass
+                db.row_factory=sqlite3.Row
+                with db:
+                    yield db
+            finally:
+                db.close()
 
     @staticmethod
     def fingerprint(row: TransactionInput) -> str:
@@ -299,7 +326,10 @@ class Ledger:
     def export_csv(self,user_id:int)->str:
         with self._db() as db: rows=list(db.execute("SELECT booked_on,amount,currency,merchant,category,description,source,external_id FROM transactions WHERE user_id=? ORDER BY booked_on,id",(user_id,)))
         out=io.StringIO(); writer=csv.writer(out); writer.writerow(["date","amount","currency","merchant","category","description","source","external_id"])
-        writer.writerows([tuple(row) for row in rows]); return out.getvalue()
+        writer.writerows([
+            tuple(_spreadsheet_safe_text(value) if isinstance(value,str) else value for value in row)
+            for row in rows
+        ]); return out.getvalue()
 
     def backup(self, destination: str | Path) -> Path:
         """Create a consistent SQLite backup without overwriting an existing file."""
@@ -366,10 +396,20 @@ def parse_statement(data:bytes, mapping:dict[str,str], filename:str)->ImportPrev
         except (ValueError,InvalidOperation,TypeError) as exc: errors.append(f"Row {line}: {exc}")
     seen=set(); unique=[]; duplicates=0
     for row in parsed:
-        key=Ledger.fingerprint(row)
+        key=("external",row.source,row.external_id) if row.external_id else ("fingerprint",Ledger.fingerprint(row))
         if key in seen: duplicates+=1
         else: seen.add(key); unique.append(row)
     return ImportPreview(unique,errors,duplicates,digest)
+
+
+def _spreadsheet_safe_text(value:str)->str:
+    """Prefix formula-like text so CSV viewers treat it as data, not a formula."""
+    if not value:
+        return value
+    trimmed=value.lstrip(" \t\r\n")
+    if value[0] in "\t\r\n" or (trimmed and trimmed[0] in "=+-@"):
+        return "'"+value
+    return value
 
 
 def commit_import(ledger:Ledger,user_id:int,preview:ImportPreview)->dict:

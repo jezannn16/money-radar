@@ -1,7 +1,9 @@
+import csv
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from decimal import Decimal
-from io import BytesIO
+from io import BytesIO, StringIO
 from stat import S_IMODE
 
 import pytest
@@ -19,6 +21,28 @@ from money_radar.core import (
 def test_decimal_and_rounding():
     assert money("1.005","RUB")==Decimal("1.00")
     assert money("1.015","RUB")==Decimal("1.02")
+    with pytest.raises(ValueError,match="three-letter ISO"):
+        money("1","РУБ")
+
+
+def test_shared_memory_ledger_survives_method_connections():
+    ledger = Ledger(":memory:")
+    row = TransactionInput(date(2026, 1, 2), Decimal("350.00"), "RUB", "coffee")
+    assert ledger.add(10, row)
+    assert not ledger.add(10, row)
+    with ledger._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM transactions WHERE user_id=10").fetchone()[0] == 1
+
+
+def test_shared_memory_ledger_serializes_concurrent_connections():
+    ledger = Ledger(":memory:")
+    def add(index):
+        row = TransactionInput(date(2026, 1, 2), Decimal("1.00"), "RUB", f"merchant-{index}")
+        return ledger.add(index, row)
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        assert all(pool.map(add, range(60)))
+    with ledger._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 60
 
 
 def test_user_isolation_report_budget_and_delete(tmp_path):
@@ -41,6 +65,63 @@ def test_import_preview_then_idempotent_commit(tmp_path):
     result=commit_import(ledger,1,preview)
     assert result["imported"]==1
     assert commit_import(ledger,1,preview)["already_imported"]
+
+
+def test_distinct_external_ids_override_fingerprint_collisions(tmp_path):
+    ledger=Ledger(tmp_path/"external-ids.sqlite3")
+    common={"booked_on":date(2026,1,1),"amount":Decimal(350),"currency":"RUB","merchant":"Cafe"}
+    assert ledger.add(1,TransactionInput(**common,external_id="bank-001"))
+    assert ledger.add(1,TransactionInput(**common,external_id="bank-002"))
+    assert not ledger.add(1,TransactionInput(**common,external_id="bank-001"))
+    assert ledger.add(1,TransactionInput(**common))
+    assert not ledger.add(1,TransactionInput(**common))
+    assert ledger.month_report(1,"2026-01")["items"][0]["count"]==3
+
+
+def test_import_preview_uses_external_id_when_present_and_fingerprint_otherwise(tmp_path):
+    csv_data=(
+        b"date,amount,currency,merchant,external_id\n"
+        b"2026-01-01,350,RUB,Cafe,bank-001\n"
+        b"2026-01-01,350,RUB,Cafe,bank-002\n"
+        b"2026-01-01,350,RUB,Cafe,bank-001\n"
+        b"2026-01-02,350,RUB,Cafe,\n"
+        b"2026-01-02,350,RUB,Cafe,\n"
+    )
+    mapping={"date":"date","amount":"amount","currency":"currency","merchant":"merchant","external_id":"external_id"}
+    preview=parse_statement(csv_data,mapping,"synthetic.csv")
+    assert len(preview.rows)==3 and preview.duplicates==2
+    ledger=Ledger(tmp_path/"preview-identity.sqlite3")
+    result=commit_import(ledger,1,preview)
+    assert result["imported"]==3 and result["duplicates"]==2
+
+
+def test_database_migration_replaces_legacy_full_fingerprint_index(tmp_path):
+    path=tmp_path/"old-index.sqlite3"
+    ledger=Ledger(path)
+    with ledger._db() as db:
+        db.execute("DROP INDEX uq_transaction_fingerprint")
+        db.execute("CREATE UNIQUE INDEX uq_transaction_fingerprint ON transactions(user_id,fingerprint)")
+    migrated=Ledger(path)
+    common={"booked_on":date(2026,1,1),"amount":Decimal(350),"currency":"RUB","merchant":"Cafe"}
+    assert migrated.add(1,TransactionInput(**common,external_id="bank-001"))
+    assert migrated.add(1,TransactionInput(**common,external_id="bank-002"))
+    with migrated._db() as db:
+        definition=db.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_transaction_fingerprint'").fetchone()[0]
+        assert "WHERE external_id IS NULL" in definition
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]==4
+
+
+def test_csv_export_escapes_spreadsheet_formula_text(tmp_path):
+    ledger=Ledger(tmp_path/"csv-export.sqlite3")
+    assert ledger.add(1,TransactionInput(
+        date(2026,1,1),Decimal("12.34"),"RUB","=HYPERLINK(\"https://evil.test\")",
+        category=" @SUM(A1:A2)",description="\t=cmd",source="import",external_id="+id",
+    ))
+    exported=next(csv.DictReader(StringIO(ledger.export_csv(1))))
+    assert exported["merchant"].startswith("'=")
+    assert exported["category"].startswith("'@")
+    assert exported["description"].startswith("'\t=")
+    assert exported["external_id"].startswith("'+")
 
 
 def test_xlsx_import_preview_commit_and_duplicate_batch(tmp_path):
@@ -141,7 +222,7 @@ def test_recurring_schema_migrates_existing_database(tmp_path):
     with ledger._db() as db:
         columns = {row[1] for row in db.execute("PRAGMA table_info(recurring_rules)")}
         assert "day_of_month" in columns
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 3
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 4
 
 
 def test_cbr_transport_historical_no_fallback_and_cache():
