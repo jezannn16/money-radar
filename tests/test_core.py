@@ -56,6 +56,12 @@ def test_backup_is_consistent_and_never_overwrites(tmp_path):
         ledger.backup(ledger.path)
 
 
+def test_database_file_is_private_by_default(tmp_path):
+    path = tmp_path / "private.sqlite3"
+    Ledger(path)
+    assert S_IMODE(path.stat().st_mode) == 0o600
+
+
 def test_unusual_spending_is_explainable_and_user_scoped(tmp_path):
     ledger = Ledger(tmp_path / "db.sqlite3")
     for month_num in range(7, 13):

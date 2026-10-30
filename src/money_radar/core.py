@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import os
 import re
 import sqlite3
 import ssl
@@ -71,7 +72,14 @@ class Ledger:
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP)")
 
     def _db(self):
-        db=sqlite3.connect(self.path,timeout=10); db.row_factory=sqlite3.Row; return db
+        if self.path != ":memory:":
+            fd=os.open(self.path,os.O_CREAT|os.O_RDWR,0o600);os.close(fd)
+        db=sqlite3.connect(self.path,timeout=10)
+        if self.path != ":memory:":
+            for candidate in (self.path,self.path+"-wal",self.path+"-shm",self.path+"-journal"):
+                try:os.chmod(candidate,0o600)
+                except FileNotFoundError:pass
+        db.row_factory=sqlite3.Row; return db
 
     @staticmethod
     def fingerprint(row: TransactionInput) -> str:
