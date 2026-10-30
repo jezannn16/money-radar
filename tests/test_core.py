@@ -62,6 +62,20 @@ def test_database_file_is_private_by_default(tmp_path):
     assert S_IMODE(path.stat().st_mode) == 0o600
 
 
+def test_categories_and_transaction_filters_are_user_scoped(tmp_path):
+    ledger=Ledger(tmp_path/"filters.db")
+    ledger.add_category(1,"Food");ledger.add_category(2,"Private")
+    ledger.add(1,TransactionInput(date(2026,1,2),Decimal(12),"RUB","Cafe North","Food"))
+    ledger.add(1,TransactionInput(date(2026,2,2),Decimal(20),"USD","Cafe South","Travel"))
+    ledger.add(2,TransactionInput(date(2026,1,2),Decimal(99),"RUB","Cafe North","Food"))
+    assert ledger.categories(1)==["Food","Travel"] and ledger.categories(2)==["Food","Private"]
+    rows=ledger.filter_transactions(1,date_from="2026-01-01",date_to="2026-01-31",category="Food",currency="rub",merchant="north")
+    assert len(rows)==1 and rows[0]["amount"]=="12.00"
+    assert len(ledger.filter_transactions(1,category="Food",merchant="north"))==1
+    with pytest.raises(ValueError,match="on or before"):
+        ledger.filter_transactions(1,date_from="2026-02-01",date_to="2026-01-01")
+
+
 def test_unusual_spending_is_explainable_and_user_scoped(tmp_path):
     ledger = Ledger(tmp_path / "db.sqlite3")
     for month_num in range(7, 13):
@@ -107,7 +121,7 @@ def test_recurring_schema_migrates_existing_database(tmp_path):
     with ledger._db() as db:
         columns = {row[1] for row in db.execute("PRAGMA table_info(recurring_rules)")}
         assert "day_of_month" in columns
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 2
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 3
 
 
 def test_cbr_transport_historical_no_fallback_and_cache():
@@ -120,3 +134,16 @@ def test_cbr_transport_historical_no_fallback_and_cache():
     assert adapter.rate("USD",date(2025,1,2))==Decimal("88.50")
     assert "R01235" in calls[1]
     assert adapter.rate("USD",date(2025,1,2))==Decimal("88.50") and len(calls)==2
+
+
+def test_cbr_rate_cache_survives_adapter_restart(tmp_path):
+    ledger=Ledger(tmp_path/"rates.db")
+    requested=date(2026,10,30)
+    daily=b'<ValCurs Date="30.10.2026"><Valute ID="R01235"><CharCode>USD</CharCode></Valute></ValCurs>'
+    historical=b'<ValCurs><Record Date="30.10.2026"><Nominal>1</Nominal><Value>80,25</Value></Record></ValCurs>'
+    calls=[]
+    first=CbrRates(lambda url,timeout:(calls.append(url) or (daily if "XML_daily" in url else historical)),ledger=ledger)
+    quote=first.quote("USD",requested)
+    second=CbrRates(lambda url,timeout:(_ for _ in ()).throw(AssertionError("persistent cache should avoid network")),ledger=Ledger(ledger.path))
+    assert second.quote("USD",requested)==quote
+    assert len(calls)==2 and quote.effective_date==requested

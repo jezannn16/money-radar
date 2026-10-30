@@ -63,6 +63,7 @@ class Ledger:
             CREATE TABLE IF NOT EXISTS recurring_rules(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,merchant TEXT NOT NULL,category TEXT NOT NULL,amount TEXT,currency TEXT,enabled INTEGER NOT NULL DEFAULT 1,day_of_month INTEGER NOT NULL DEFAULT 1);
             CREATE TABLE IF NOT EXISTS recurring_executions(rule_id INTEGER NOT NULL,period TEXT NOT NULL,state TEXT NOT NULL,transaction_id INTEGER,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(rule_id,period));
             CREATE TABLE IF NOT EXISTS import_batches(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,file_hash TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,UNIQUE(user_id,file_hash));
+            CREATE TABLE IF NOT EXISTS exchange_rates(currency TEXT NOT NULL,requested_date TEXT NOT NULL,effective_date TEXT NOT NULL,rate TEXT NOT NULL,fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(currency,requested_date));
             CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);
             INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,CURRENT_TIMESTAMP);
             """)
@@ -70,6 +71,7 @@ class Ledger:
             if "day_of_month" not in columns:
                 db.execute("ALTER TABLE recurring_rules ADD COLUMN day_of_month INTEGER NOT NULL DEFAULT 1")
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP)")
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,CURRENT_TIMESTAMP)")
 
     def _db(self):
         if self.path != ":memory:":
@@ -102,6 +104,45 @@ class Ledger:
         name=name.strip()
         if not name: raise ValueError("Category name cannot be empty")
         with self._db() as db: db.execute("INSERT OR IGNORE INTO categories(user_id,name) VALUES(?,?)",(user_id,name))
+
+    def categories(self,user_id:int)->list[str]:
+        with self._db() as db:
+            return [row[0] for row in db.execute("SELECT name FROM categories WHERE user_id=? UNION SELECT category FROM transactions WHERE user_id=? ORDER BY 1 COLLATE NOCASE",(user_id,user_id))]
+
+    def filter_transactions(
+        self,user_id:int,*,date_from:str|None=None,date_to:str|None=None,
+        category:str|None=None,currency:str|None=None,merchant:str|None=None,
+        limit:int=100,
+    )->list[sqlite3.Row]:
+        clauses=["user_id=?"]; values:list[object]=[user_id]
+        for field,value,operator in (("booked_on",date_from,">="),("booked_on",date_to,"<=")):
+            if value:
+                try: date.fromisoformat(value)
+                except ValueError as exc: raise ValueError("Dates must use YYYY-MM-DD") from exc
+                clauses.append(f"{field}{operator}?"); values.append(value)
+        if date_from and date_to and date_from>date_to:
+            raise ValueError("date_from must be on or before date_to")
+        for column,value in (("category",category),("currency",currency)):
+            if value:
+                clauses.append(f"{column}=?"); values.append(value.strip() if column=="category" else value.strip().upper())
+        if merchant:
+            clauses.append("merchant LIKE ? COLLATE NOCASE"); values.append(f"%{merchant.strip()}%")
+        if not 1<=limit<=500:
+            raise ValueError("Limit must be between 1 and 500")
+        query=("SELECT id,booked_on,amount,currency,merchant,category,description,source,external_id "
+               "FROM transactions WHERE "+" AND ".join(clauses)+" ORDER BY booked_on DESC,id DESC LIMIT ?")
+        values.append(limit)
+        with self._db() as db:return list(db.execute(query,values))
+
+    def cached_exchange_rate(self,currency:str,requested_date:date)->tuple[Decimal,date]|None:
+        with self._db() as db:
+            row=db.execute("SELECT rate,effective_date FROM exchange_rates WHERE currency=? AND requested_date=?",(currency,requested_date.isoformat())).fetchone()
+        return (Decimal(row["rate"]),date.fromisoformat(row["effective_date"])) if row else None
+
+    def save_exchange_rate(self,currency:str,requested_date:date,effective_date:date,rate:Decimal)->None:
+        if not rate.is_finite() or rate<=0:raise ValueError("Exchange rate must be positive and finite")
+        with self._db() as db:
+            db.execute("INSERT INTO exchange_rates(currency,requested_date,effective_date,rate) VALUES(?,?,?,?) ON CONFLICT(currency,requested_date) DO UPDATE SET effective_date=excluded.effective_date,rate=excluded.rate,fetched_at=CURRENT_TIMESTAMP",(currency,requested_date.isoformat(),effective_date.isoformat(),str(rate)))
 
     def add_recurring_rule(
         self, user_id: int, merchant: str, category: str, amount: Decimal,
@@ -346,22 +387,44 @@ def commit_import(ledger:Ledger,user_id:int,preview:ImportPreview)->dict:
     return {"batch_id":batch_id,"imported":imported,"duplicates":duplicates+preview.duplicates,"errors":preview.errors,"already_imported":False}
 
 
+@dataclass(frozen=True)
+class ExchangeRateQuote:
+    currency: str
+    requested_date: date
+    effective_date: date
+    rate: Decimal
+
+
 class CbrRates:
-    """Public Bank of Russia XML daily/dynamic rate adapter with bounded network timeout."""
+    """Public Bank of Russia XML adapter with date-keyed cache and effective-date metadata."""
     BASE="https://www.cbr.ru/scripts/"
-    def __init__(self,transport:Callable[[str,float],bytes]|None=None,timeout:float=5.0):
-        self.transport=transport or self._get; self.timeout=timeout; self.cache={}
+    def __init__(self,transport:Callable[[str,float],bytes]|None=None,timeout:float=5.0,ledger:Ledger|None=None):
+        self.transport=transport or self._get; self.timeout=timeout; self.ledger=ledger
+        self.cache:dict[tuple[str,date],ExchangeRateQuote]={}
     @staticmethod
     def _get(url:str,timeout:float)->bytes:
         request=urllib.request.Request(url,headers={"User-Agent":"MoneyRadar/0.1 (+personal local tool)"})
         context=ssl.create_default_context(cafile=certifi.where())
         with urllib.request.urlopen(request,timeout=timeout,context=context) as response: return response.read(2_000_000)
-    def rate(self,currency:str,on_date:date|None=None)->Decimal:
+    @staticmethod
+    def _effective_date(value:str|None,default:date)->date:
+        if not value:return default
+        try:return datetime.strptime(value,"%d.%m.%Y").date()
+        except ValueError as exc:raise RuntimeError("CBR returned an invalid effective date") from exc
+
+    def quote(self,currency:str,on_date:date|None=None)->ExchangeRateQuote:
         code=currency.upper(); day=on_date or date.today(); key=(code,day)
         if not re.fullmatch(r"[A-Z]{3}", code):
             raise ValueError("Currency must be a three-letter ISO code")
-        if code=="RUB": return Decimal(1)
-        if key in self.cache: return self.cache[key]
+        if key in self.cache:return self.cache[key]
+        if self.ledger:
+            cached=self.ledger.cached_exchange_rate(code,day)
+            if cached:
+                quote=ExchangeRateQuote(code,day,cached[1],cached[0]);self.cache[key]=quote;return quote
+        if code=="RUB":
+            quote=ExchangeRateQuote(code,day,day,Decimal(1))
+            if self.ledger:self.ledger.save_exchange_rate(code,day,day,quote.rate)
+            self.cache[key]=quote;return quote
         url=f"{self.BASE}XML_daily.asp?date_req={day:%d/%m/%Y}"
         try: payload=self.transport(url,self.timeout)
         except (TimeoutError,urllib.error.URLError) as exc: raise RuntimeError("CBR rates are temporarily unavailable; retry later") from exc
@@ -375,9 +438,18 @@ class CbrRates:
             root=ET.fromstring(payload)
             vals=root.findall("Record")
             if not vals: raise ValueError(f"No CBR rate available for {code} on {day}")
-            node=vals[-1]; nominal=Decimal(node.findtext("Nominal","1")); value=Decimal(node.findtext("Value","0").replace(",",".")); result=value/nominal
+            node=vals[-1]
+            effective=self._effective_date(node.attrib.get("Date"),day)
+            if effective!=day:raise ValueError(f"No exact CBR rate available for {code} on {day}")
+            nominal=Decimal(node.findtext("Nominal","1")); value=Decimal(node.findtext("Value","0").replace(",",".")); result=value/nominal
         else:
             node=next((n for n in root.findall("Valute") if n.findtext("CharCode")==code),None)
             if node is None: raise ValueError(f"Currency {code} not found in CBR daily rates")
+            effective=self._effective_date(root.attrib.get("Date"),day)
             result=Decimal(node.findtext("Value","0").replace(",","."))/Decimal(node.findtext("Nominal","1"))
-        self.cache[key]=result; return result
+        quote=ExchangeRateQuote(code,day,effective,result)
+        if self.ledger:self.ledger.save_exchange_rate(code,day,effective,result)
+        self.cache[key]=quote;return quote
+
+    def rate(self,currency:str,on_date:date|None=None)->Decimal:
+        return self.quote(currency,on_date).rate

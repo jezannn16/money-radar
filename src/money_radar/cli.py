@@ -12,6 +12,9 @@ def main()->None:
     p=argparse.ArgumentParser(prog="money-radar"); p.add_argument("--db",default="money_radar.sqlite3")
     sub=p.add_subparsers(dest="command",required=True)
     add=sub.add_parser("add"); add.add_argument("amount"); add.add_argument("currency"); add.add_argument("merchant"); add.add_argument("--date",default=date.today().isoformat()); add.add_argument("--category",default="Uncategorized"); add.add_argument("--user",type=int,required=True)
+    category_add=sub.add_parser("category-add"); category_add.add_argument("name"); category_add.add_argument("--user",type=int,required=True)
+    category_list=sub.add_parser("categories"); category_list.add_argument("--user",type=int,required=True)
+    tx_filter=sub.add_parser("filter"); tx_filter.add_argument("--from",dest="date_from"); tx_filter.add_argument("--to",dest="date_to"); tx_filter.add_argument("--category"); tx_filter.add_argument("--currency"); tx_filter.add_argument("--merchant"); tx_filter.add_argument("--limit",type=int,default=100); tx_filter.add_argument("--user",type=int,required=True)
     report=sub.add_parser("month"); report.add_argument("month"); report.add_argument("--user",type=int,required=True)
     unusual=sub.add_parser("unusual"); unusual.add_argument("month"); unusual.add_argument("--user",type=int,required=True)
     recurring_add=sub.add_parser("recurring-add"); recurring_add.add_argument("merchant"); recurring_add.add_argument("category"); recurring_add.add_argument("amount"); recurring_add.add_argument("currency"); recurring_add.add_argument("--day",type=int,default=1); recurring_add.add_argument("--user",type=int,required=True)
@@ -28,6 +31,14 @@ def main()->None:
     if args.command=="add":
         row=TransactionInput(date.fromisoformat(args.date),money(args.amount,args.currency),args.currency,args.merchant,args.category)
         print("Расход добавлен." if ledger.add(args.user,row) else "Дубликат не добавлен.")
+    elif args.command=="category-add":
+        ledger.add_category(args.user,args.name);print("Категория сохранена.")
+    elif args.command=="categories":
+        print("\n".join(ledger.categories(args.user)) or "Категорий нет.")
+    elif args.command=="filter":
+        rows=ledger.filter_transactions(args.user,date_from=args.date_from,date_to=args.date_to,category=args.category,currency=args.currency,merchant=args.merchant,limit=args.limit)
+        for row in rows:print(f"#{row['id']} {row['booked_on']} | {row['merchant']} | {row['amount']} {row['currency']} | {row['category']}")
+        if not rows:print("Операций по фильтру нет.")
     elif args.command=="month":
         result=ledger.month_report(args.user,args.month)
         print(f"Отчёт {args.month}")
@@ -68,6 +79,8 @@ def main()->None:
     elif args.command=="export": print(ledger.export_csv(args.user),end="")
     elif args.command=="backup": print(f"SQLite backup created: {ledger.backup(args.destination)}")
     elif args.command=="delete-user": ledger.delete_user(args.user); print("Данные пользователя удалены.")
-    elif args.command=="rate": print(CbrRates().rate(args.currency,date.fromisoformat(args.date) if args.date else None))
+    elif args.command=="rate":
+        quote=CbrRates(ledger=ledger).quote(args.currency,date.fromisoformat(args.date) if args.date else None)
+        print(f"{quote.currency}: {quote.rate} RUB за 1 {quote.currency}; дата курса {quote.effective_date} (запрошено {quote.requested_date})")
 
 if __name__=="__main__": main()

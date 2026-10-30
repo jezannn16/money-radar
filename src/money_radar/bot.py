@@ -32,7 +32,36 @@ def main()->None:
 
     @dp.message(Command("help"))
     async def help_cmd(message:Message)->None:
-        if await authorize(message):await message.answer("/add merchant amount [currency] — preview с кнопками подтверждения\n/month YYYY-MM — отчёт\n/unusual YYYY-MM — кандидаты на необычные расходы\n/budget YYYY-MM category amount currency\n/recurring-add merchant category amount currency [day]\n/recurring-list, /recurring-run YYYY-MM, /recurring-disable ID\nЭкспорт/импорт выписок доступны через CLI.")
+        if await authorize(message):await message.answer("/add merchant amount [currency] — preview с кнопками подтверждения\n/month YYYY-MM — отчёт\n/unusual YYYY-MM — кандидаты на необычные расходы\n/category-add имя; /categories\n/filter from=YYYY-MM-DD to=YYYY-MM-DD category=Food currency=RUB merchant=cafe (все фильтры необязательны)\n/budget YYYY-MM category amount currency\n/recurring-add merchant category amount currency [day]\n/recurring-list, /recurring-run YYYY-MM, /recurring-disable ID\nЭкспорт/импорт выписок доступны через CLI.")
+
+    @dp.message(Command("category-add"))
+    async def category_add(message:Message)->None:
+        if not await authorize(message):return
+        name=(message.text or "").partition(" ")[2].strip()
+        if not name:await message.answer("Формат: /category-add название");return
+        try:ledger.add_category(message.from_user.id,name)
+        except ValueError as exc:await message.answer(str(exc));return
+        await message.answer("Категория сохранена.")
+
+    @dp.message(Command("categories"))
+    async def categories(message:Message)->None:
+        if not await authorize(message):return
+        names=ledger.categories(message.from_user.id)
+        await message.answer("Категории:\n"+"\n".join(names) if names else "Категорий пока нет.")
+
+    @dp.message(Command("filter"))
+    async def transaction_filter(message:Message)->None:
+        if not await authorize(message):return
+        filters={}
+        for part in (message.text or "").split()[1:]:
+            if "=" not in part:await message.answer("Фильтры задаются как ключ=значение; используйте /help.");return
+            key,value=part.split("=",1)
+            if key not in {"from","to","category","currency","merchant"} or not value:await message.answer(f"Неизвестный или пустой фильтр: {key}");return
+            filters[key]=value.replace("_"," ") if key in {"category","merchant"} else value
+        try:rows=ledger.filter_transactions(message.from_user.id,date_from=filters.get("from"),date_to=filters.get("to"),category=filters.get("category"),currency=filters.get("currency"),merchant=filters.get("merchant"),limit=30)
+        except ValueError as exc:await message.answer(str(exc));return
+        if not rows:await message.answer("Операций по фильтру нет.");return
+        await message.answer("Операции:\n"+"\n".join(f"{r['booked_on']} {r['merchant']}: {r['amount']} {r['currency']} — {r['category']}" for r in rows))
 
     @dp.message(Command("add"))
     async def add(message:Message)->None:

@@ -49,6 +49,9 @@ uv run money-radar --db demo.sqlite3 unusual 2026-10 --user 42
 uv run money-radar --db demo.sqlite3 recurring-add rent Home 50000 RUB --day 1 --user 42
 uv run money-radar --db demo.sqlite3 recurring-run 2026-10 --user 42
 uv run money-radar --db demo.sqlite3 rate USD --date 2025-01-15
+uv run money-radar --db demo.sqlite3 category-add Food --user 42
+uv run money-radar --db demo.sqlite3 categories --user 42
+uv run money-radar --db demo.sqlite3 filter --from 2026-10-01 --to 2026-10-31 --category Food --user 42
 uv run money-radar --db demo.sqlite3 backup backups/demo.sqlite3
 ```
 
@@ -69,6 +72,7 @@ Recurring rules применяются явно командой `recurring-run 
 ## Исторические курсы
 
 При `rate USD --date YYYY-MM-DD` Money Radar получает код валюты из дневного XML ответа ЦБ, затем запрашивает динамический курс за указанную дату. Значение относится к единице валюты после деления на `Nominal`. Если данных на дату нет, команда сообщает об этом и не подставляет текущий курс.
+Успешные ответы кэшируются в таблице приложения по валюте и запрошенной дате, включая фактическую дату курса; кэш переживает перезапуск.
 
 ## Проверки
 
