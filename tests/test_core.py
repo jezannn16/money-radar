@@ -67,6 +67,20 @@ def test_import_preview_then_idempotent_commit(tmp_path):
     assert commit_import(ledger,1,preview)["already_imported"]
 
 
+def test_empty_confirmed_preview_does_not_block_corrected_mapping(tmp_path):
+    data=b"date,amount,currency,merchant\n2026-01-01,350,RUB,Cafe\n"
+    ledger=Ledger(tmp_path/"empty-import.db")
+    invalid=parse_statement(data,{"date":"missing","amount":"amount","merchant":"merchant"},"statement.csv")
+    assert invalid.rows == [] and invalid.errors
+
+    result=commit_import(ledger,7,invalid)
+    assert result["imported"] == 0
+    corrected=parse_statement(data,{"date":"date","amount":"amount","currency":"currency","merchant":"merchant"},"statement.csv")
+    result=commit_import(ledger,7,corrected)
+    assert result["imported"] == 1
+    assert ledger.month_report(7,"2026-01")["items"][0]["spent"] == Decimal("350.00")
+
+
 def test_distinct_external_ids_override_fingerprint_collisions(tmp_path):
     ledger=Ledger(tmp_path/"external-ids.sqlite3")
     common={"booked_on":date(2026,1,1),"amount":Decimal(350),"currency":"RUB","merchant":"Cafe"}

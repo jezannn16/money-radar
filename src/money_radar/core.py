@@ -415,6 +415,12 @@ def _spreadsheet_safe_text(value:str)->str:
 def commit_import(ledger:Ledger,user_id:int,preview:ImportPreview)->dict:
     """Commit only after explicit caller confirmation; batch record makes reruns visible/idempotent."""
     imported=duplicates=0
+    # A bad column mapping can produce an empty preview. Do not consume the
+    # file-hash idempotency key in that case: the user must be able to correct
+    # the mapping and confirm the same file afterward.
+    if not preview.rows:
+        return {"batch_id":None,"imported":0,"duplicates":preview.duplicates,
+                "errors":preview.errors,"already_imported":False}
     with ledger._db() as db:
         try: cur=db.execute("INSERT INTO import_batches(user_id,file_hash) VALUES(?,?)",(user_id,preview.file_hash))
         except sqlite3.IntegrityError: return {"batch_id":None,"imported":0,"duplicates":len(preview.rows),"errors":preview.errors,"already_imported":True}
